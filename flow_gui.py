@@ -125,7 +125,13 @@ class MFCController:
             raise ValueError(f"Flow {flow:.4f} out of range [0, {max_f:.4f}]")
         flow_l_min = flow_to_l_min(flow, self.working_unit, self.sel_gas)
         cal_l_min = flow_l_min / self._gcf_correction
-        self._instrument.setpoint = round((cal_l_min / self._max_cal_l_min) * FULL_SCALE)
+        setpoint = round((cal_l_min / self._max_cal_l_min) * FULL_SCALE)
+        # instrument.setpoint's property setter returns True/False for ack, but
+        # that return value is unreachable through `self._instrument.setpoint =
+        # ...` assignment syntax (Python discards it) — call writeParameter
+        # directly so a failed/unacknowledged write is actually detected.
+        if not self._instrument.writeParameter(9, setpoint):
+            raise RuntimeError(f"Instrument on {self.com_port} did not acknowledge the new setpoint.")
 
     def read_flow(self) -> float:
         """Returns flow expressed in working_unit."""
@@ -135,7 +141,8 @@ class MFCController:
         return l_min_to_flow(sel_l_min, self.working_unit, self.sel_gas)
 
     def stop(self) -> None:
-        self._instrument.setpoint = 0
+        if not self._instrument.writeParameter(9, 0):
+            raise RuntimeError(f"Instrument on {self.com_port} did not acknowledge the stop command.")
 
     @staticmethod
     def _validate_gas(key):
