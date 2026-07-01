@@ -49,6 +49,19 @@ GAS_DB: dict[str, GasProperties] = {
 
 FULL_SCALE = 32000
 
+# FLOW-BUS DDE parameter numbers used directly (bypassing propar's property
+# setters, whose True/False ack return value is unreachable through plain
+# attribute assignment).
+DDE_SETPOINT = 9
+DDE_CONTROL_MODE = 12
+
+# Control Mode (DDE 12) values relevant here. 18 is the instrument's normal
+# closed-loop mode where the valve follows the RS232 setpoint (DDE 9); 3 and 8
+# are direct valve overrides that ignore the setpoint entirely.
+CONTROL_MODE_RS232_SETPOINT = 18
+CONTROL_MODE_VALVE_CLOSED = 3
+CONTROL_MODE_VALVE_OPEN = 8
+
 
 def flow_to_l_min(value: float, unit: FlowUnit, gas: GasProperties) -> float:
     if unit == FlowUnit.LN_MIN:
@@ -118,19 +131,25 @@ class MFCController:
         l_min = self._max_cal_l_min * self._gcf_correction
         return l_min_to_flow(l_min, self.working_unit, self.sel_gas)
 
+    def _write_control_mode(self, mode: int) -> None:
+        if not self._instrument.writeParameter(DDE_CONTROL_MODE, mode):
+            raise RuntimeError(f"Instrument on {self.com_port} did not acknowledge control mode {mode}.")
+
     def set_flow(self, flow: float) -> None:
-        """flow is expressed in working_unit."""
+        """flow is expressed in working_unit. Resumes closed-loop RS232 setpoint
+        control first, in case a valve override (open_valve/close_valve) is active."""
         max_f = self.max_selected_flow
         if not 0 <= flow <= max_f:
             raise ValueError(f"Flow {flow:.4f} out of range [0, {max_f:.4f}]")
         flow_l_min = flow_to_l_min(flow, self.working_unit, self.sel_gas)
         cal_l_min = flow_l_min / self._gcf_correction
         setpoint = round((cal_l_min / self._max_cal_l_min) * FULL_SCALE)
+        self._write_control_mode(CONTROL_MODE_RS232_SETPOINT)
         # instrument.setpoint's property setter returns True/False for ack, but
         # that return value is unreachable through `self._instrument.setpoint =
         # ...` assignment syntax (Python discards it) — call writeParameter
         # directly so a failed/unacknowledged write is actually detected.
-        if not self._instrument.writeParameter(9, setpoint):
+        if not self._instrument.writeParameter(DDE_SETPOINT, setpoint):
             raise RuntimeError(f"Instrument on {self.com_port} did not acknowledge the new setpoint.")
 
     def read_flow(self) -> float:
@@ -141,8 +160,23 @@ class MFCController:
         return l_min_to_flow(sel_l_min, self.working_unit, self.sel_gas)
 
     def stop(self) -> None:
-        if not self._instrument.writeParameter(9, 0):
+        """Resume closed-loop control (in case a valve override is active) and
+        drive the setpoint to zero."""
+        self._write_control_mode(CONTROL_MODE_RS232_SETPOINT)
+        if not self._instrument.writeParameter(DDE_SETPOINT, 0):
             raise RuntimeError(f"Instrument on {self.com_port} did not acknowledge the stop command.")
+
+    def open_valve(self) -> None:
+        """Drive the valve fully open directly, bypassing closed-loop flow control."""
+        self._write_control_mode(CONTROL_MODE_VALVE_OPEN)
+
+    def close_valve(self) -> None:
+        """Drive the valve fully closed directly, bypassing closed-loop flow control."""
+        self._write_control_mode(CONTROL_MODE_VALVE_CLOSED)
+
+    def resume_control(self) -> None:
+        """Return to normal closed-loop RS232 setpoint control."""
+        self._write_control_mode(CONTROL_MODE_RS232_SETPOINT)
 
     @staticmethod
     def _validate_gas(key):
@@ -263,6 +297,25 @@ class FlowMonitorApp:
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.stop_monitoring, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
+        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        ttk.Label(btn_frame, text="Valve override:").pack(side=tk.LEFT, padx=(0, 5))
+
+        self.open_valve_btn = ttk.Button(
+            btn_frame, text="Fully Open", command=self.open_valve_override, state=tk.DISABLED
+        )
+        self.open_valve_btn.pack(side=tk.LEFT, padx=5)
+
+        self.close_valve_btn = ttk.Button(
+            btn_frame, text="Fully Close", command=self.close_valve_override, state=tk.DISABLED
+        )
+        self.close_valve_btn.pack(side=tk.LEFT, padx=5)
+
+        self.resume_control_btn = ttk.Button(
+            btn_frame, text="Resume Control", command=self.resume_control, state=tk.DISABLED
+        )
+        self.resume_control_btn.pack(side=tk.LEFT, padx=5)
+
         self.status_var = tk.StringVar(value="Not connected.")
         ttk.Label(top, textvariable=self.status_var, foreground="gray").grid(
             row=4, column=0, columnspan=8, sticky="w", pady=(8, 0)
@@ -312,6 +365,9 @@ class FlowMonitorApp:
             self.status_var.set(f"Connected to {com_port}.")
             self.start_btn.config(state=tk.NORMAL)
             self.set_flow_btn.config(state=tk.NORMAL)
+            self.open_valve_btn.config(state=tk.NORMAL)
+            self.close_valve_btn.config(state=tk.NORMAL)
+            self.resume_control_btn.config(state=tk.NORMAL)
             self.connect_btn.config(state=tk.DISABLED)
             self.working_unit_combo.config(state="readonly")
         except Exception as exc:
@@ -380,6 +436,68 @@ class FlowMonitorApp:
             messagebox.showerror("Invalid flow", str(exc))
             return
 
+        unit_label = self.mfc.working_unit.value
+        self._begin_logging(
+            run_label=f"target {target_flow} {unit_label}",
+            setpoint_value=target_flow,
+            setpoint_label=f"Setpoint ({target_flow} {unit_label})",
+        )
+
+    def open_valve_override(self):
+        """Drive the valve fully open directly, bypassing closed-loop flow
+        control, and keep/start monitoring so the resulting flow can be watched."""
+        if self.mfc is None:
+            return
+        try:
+            self.mfc.open_valve()
+        except Exception as exc:
+            messagebox.showerror("Failed to open valve", str(exc))
+            return
+        self.status_var.set("Valve forced FULLY OPEN (bypassing flow control).")
+        self._ensure_logging(run_label="valve forced OPEN")
+
+    def close_valve_override(self):
+        """Drive the valve fully closed directly, bypassing closed-loop flow
+        control, and keep/start monitoring so the resulting flow can be watched."""
+        if self.mfc is None:
+            return
+        try:
+            self.mfc.close_valve()
+        except Exception as exc:
+            messagebox.showerror("Failed to close valve", str(exc))
+            return
+        self.status_var.set("Valve forced FULLY CLOSED (bypassing flow control).")
+        self._ensure_logging(run_label="valve forced CLOSED")
+
+    def resume_control(self):
+        """Return to normal closed-loop RS232 setpoint control without changing
+        the setpoint value itself."""
+        if self.mfc is None:
+            return
+        try:
+            self.mfc.resume_control()
+        except Exception as exc:
+            messagebox.showerror("Failed to resume control", str(exc))
+            return
+        self.status_var.set("Resumed normal closed-loop setpoint control.")
+
+    def _ensure_logging(self, run_label: str):
+        """Start a fresh logging/plot run if one isn't already active; otherwise
+        just relabel the current plot so the override shows up on the same run."""
+        if self.monitor_thread is not None and self.monitor_thread.is_alive():
+            if self.setpoint_line is not None:
+                self.setpoint_line.remove()
+                self.setpoint_line = None
+                self.ax.legend(loc="upper right")
+            self.ax.set_title(f"{self.mfc.sel_gas.name}  |  {self.mfc.com_port}  |  {run_label}")
+            self.canvas.draw_idle()
+        else:
+            self._begin_logging(run_label=run_label, setpoint_value=None, setpoint_label=None)
+
+    def _begin_logging(self, run_label: str, setpoint_value: float | None, setpoint_label: str | None):
+        """Open a new CSV log, reset the plots, and start the background
+        monitor thread. setpoint_value/label draw a reference line when a
+        numeric target flow applies (not used for valve-override runs)."""
         csv_filename = f"flow_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         self.csv_file = open(csv_filename, "w", newline="")
         self.csv_writer = csv.writer(self.csv_file)
@@ -399,12 +517,14 @@ class FlowMonitorApp:
         self.ax.clear()
         self.ax2.clear()
         (self.line,) = self.ax.plot([], [], color="steelblue", linewidth=1.5, label=gas_symbol)
-        self.setpoint_line = self.ax.axhline(
-            target_flow, color="tomato", linestyle="--", linewidth=1,
-            label=f"Setpoint ({target_flow} {unit_label})",
-        )
+        if setpoint_value is not None:
+            self.setpoint_line = self.ax.axhline(
+                setpoint_value, color="tomato", linestyle="--", linewidth=1, label=setpoint_label,
+            )
+        else:
+            self.setpoint_line = None
         self.ax.set_ylabel(f"Flow ({unit_label})")
-        self.ax.set_title(f"{self.mfc.sel_gas.name}  |  {self.mfc.com_port}  |  {csv_filename}")
+        self.ax.set_title(f"{self.mfc.sel_gas.name}  |  {self.mfc.com_port}  |  {run_label}  |  {csv_filename}")
         self.ax.legend(loc="upper right")
         self.ax.grid(True, alpha=0.3)
 
