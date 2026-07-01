@@ -431,9 +431,15 @@ class FlowMonitorApp:
         if self.monitor_thread is not None:
             self.monitor_thread.join(timeout=5)
 
+        # Drain any readings the background thread queued up before it exited,
+        # so they're written while the file is still open instead of being
+        # picked up later by _poll_queue's timer after we've closed it below.
+        self._drain_queue()
+
         if self.csv_file is not None:
             self.csv_file.close()
             self.csv_file = None
+        self.csv_writer = None
 
         self.setpoint_line = None
 
@@ -461,7 +467,9 @@ class FlowMonitorApp:
     # Main-thread queue poller — safe to touch Tk/matplotlib here
     # ------------------------------------------------------------------
 
-    def _poll_queue(self):
+    def _drain_queue(self):
+        """Process every reading currently sitting in the queue. Safe to call
+        both from the periodic poll and synchronously from stop_monitoring."""
         try:
             while True:
                 item = self.data_queue.get_nowait()
@@ -500,6 +508,10 @@ class FlowMonitorApp:
                 self.canvas.draw_idle()
         except queue.Empty:
             pass
+
+    def _poll_queue(self):
+        try:
+            self._drain_queue()
         finally:
             self.root.after(200, self._poll_queue)
 
