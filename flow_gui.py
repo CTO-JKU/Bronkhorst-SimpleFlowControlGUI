@@ -216,6 +216,7 @@ class FlowMonitorApp:
         self.cumulative_data: list[float] = []
         self.start_time = 0.0
         self.setpoint_line = None
+        self.injection_count = 0
 
         self._build_ui()
         self._poll_queue()
@@ -316,10 +317,25 @@ class FlowMonitorApp:
         )
         self.resume_control_btn.pack(side=tk.LEFT, padx=5)
 
+        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        self.inject_btn = ttk.Button(btn_frame, text="Injected", command=self.record_injection, state=tk.DISABLED)
+        self.inject_btn.pack(side=tk.LEFT, padx=5)
+
         self.status_var = tk.StringVar(value="Not connected.")
         ttk.Label(top, textvariable=self.status_var, foreground="gray").grid(
             row=4, column=0, columnspan=8, sticky="w", pady=(8, 0)
         )
+
+        # Row 5: large, easy-to-read current flow readout
+        readout_frame = ttk.Frame(top)
+        readout_frame.grid(row=5, column=0, columnspan=8, sticky="w", pady=(8, 0))
+        ttk.Label(readout_frame, text="Current flow:").pack(side=tk.LEFT)
+        self.current_flow_var = tk.StringVar(value="—")
+        ttk.Label(
+            readout_frame, textvariable=self.current_flow_var,
+            font=("TkDefaultFont", 18, "bold"), foreground="steelblue",
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         # --- Plots: flow rate (top) + cumulative amount (bottom) ---
         self.fig = Figure(figsize=(9, 6), dpi=100)
@@ -481,6 +497,29 @@ class FlowMonitorApp:
             return
         self.status_var.set("Resumed normal closed-loop setpoint control.")
 
+    def record_injection(self):
+        """Mark the current moment as an injection: write a timestamped row to
+        the CSV log (event column) and draw a marker line on both plots."""
+        if self.csv_writer is None:
+            messagebox.showerror("Not monitoring", "Start monitoring before recording an injection.")
+            return
+        elapsed = time.monotonic() - self.start_time
+        ts = datetime.now().isoformat()
+        self.injection_count += 1
+        self.csv_writer.writerow([ts, f"{elapsed:.2f}", "", "", f"injection {self.injection_count}"])
+        self.csv_file.flush()
+
+        for ax in (self.ax, self.ax2):
+            ax.axvline(elapsed, color="purple", linestyle=":", linewidth=1.2)
+        self.ax.annotate(
+            f"inj {self.injection_count}", xy=(elapsed, 1), xycoords=("data", "axes fraction"),
+            xytext=(2, -4), textcoords="offset points", rotation=90, fontsize=8,
+            color="purple", va="top", ha="left",
+        )
+        self.canvas.draw_idle()
+
+        self.status_var.set(f"Injection #{self.injection_count} recorded at {elapsed:.1f}s ({ts}).")
+
     def _ensure_logging(self, run_label: str):
         """Start a fresh logging/plot run if one isn't already active; otherwise
         just relabel the current plot so the override shows up on the same run."""
@@ -505,7 +544,7 @@ class FlowMonitorApp:
         gas_symbol = self.mfc.sel_gas.symbol
         cum_unit = CUMULATIVE_UNIT_LABEL[self.mfc.working_unit]
         self.csv_writer.writerow(
-            ["timestamp", "elapsed_s", f"flow_{unit_label}_{gas_symbol}", f"cumulative_{cum_unit}_{gas_symbol}"]
+            ["timestamp", "elapsed_s", f"flow_{unit_label}_{gas_symbol}", f"cumulative_{cum_unit}_{gas_symbol}", "event"]
         )
 
         self.elapsed_data.clear()
@@ -513,6 +552,7 @@ class FlowMonitorApp:
         self.cumulative_data.clear()
         self.start_time = time.monotonic()
         self.stop_event.clear()
+        self.injection_count = 0
 
         self.ax.clear()
         self.ax2.clear()
@@ -542,6 +582,7 @@ class FlowMonitorApp:
         self.status_var.set(f"Monitoring... logging to {csv_filename}")
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
+        self.inject_btn.config(state=tk.NORMAL)
         self.working_unit_combo.config(state="disabled")
 
     def stop_monitoring(self):
@@ -571,8 +612,10 @@ class FlowMonitorApp:
         self.setpoint_line = None
 
         self.status_var.set(f"Stopped. {len(self.flow_data)} samples recorded.")
+        self.current_flow_var.set("—")
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+        self.inject_btn.config(state=tk.DISABLED)
         self.working_unit_combo.config(state="readonly")
 
     # ------------------------------------------------------------------
@@ -619,8 +662,13 @@ class FlowMonitorApp:
                 self.cumulative_data.append(cumulative)
 
                 if self.csv_writer is not None:
-                    self.csv_writer.writerow([ts, f"{elapsed:.2f}", f"{flow:.4f}", f"{cumulative:.4f}"])
+                    self.csv_writer.writerow([ts, f"{elapsed:.2f}", f"{flow:.4f}", f"{cumulative:.4f}", ""])
                     self.csv_file.flush()
+
+                if self.mfc is not None:
+                    self.current_flow_var.set(
+                        f"{flow:.4f} {self.mfc.working_unit.value} {self.mfc.sel_gas.symbol}"
+                    )
 
                 self.line.set_data(self.elapsed_data, self.flow_data)
                 self.ax.set_xlim(max(0, elapsed - WINDOW_S), elapsed + 2)
